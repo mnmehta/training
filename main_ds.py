@@ -8,6 +8,10 @@ import time
 import torch
 import sys
 from tqdm import tqdm
+#import habana_frameworks.torch.gpu_migration
+import habana_frameworks.torch.core as htcore
+import habana_frameworks.torch as htorch
+
 from transformers import (
     AutoModelForCausalLM,
     get_scheduler,
@@ -19,7 +23,7 @@ from torch.distributed import (
 )
 
 import deepspeed
-from deepspeed.ops.adam import FusedAdam
+#from deepspeed.ops.adam import FusedAdam
 from multipack_sampler import find_packing_max_batch_len_and_grad_accum
 from token_dataset import setup_dataloader, setup_dataset
 from tokenizer_utils import setup_tokenizer
@@ -27,6 +31,7 @@ from utils import save_hf_format_ds, set_random_seed, setup_logger, convert_loss
 
 
 def get_ds_config(world_size, samples_per_gpu, grad_accum):
+
     ds_config = {
         "train_batch_size": samples_per_gpu * world_size * grad_accum,
         "gradient_accumulation_steps": grad_accum,
@@ -42,7 +47,33 @@ def get_ds_config(world_size, samples_per_gpu, grad_accum):
         "prescale_gradients": False,
         "wall_clock_breakdown": False,
     }
+   
     return ds_config
+
+def setup_training(args):
+    if 'WORLD_SIZE' in os.environ:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+
+    if 'RANK' in os.environ:
+        args.rank = int(os.environ["RANK"])
+
+    if 'LOCAL_RANK' in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
+
+    if os.getenv('MASTER_ADDR') is None:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    if os.getenv('MASTER_PORT') is None:
+        os.environ['MASTER_PORT'] = '12345'
+
+    init_method = None
+
+    import habana_frameworks.torch.hpu
+    import habana_frameworks.torch.distributed.hccl
+    device = torch.device("hpu")
+    dist_backend = "hccl"
+    print(f"Distributed training with backend={dist_backend}, device={device}, local_rank={args.local_rank}")
+    deepspeed.init_distributed(dist_backend=dist_backend, init_method=init_method)
+    return device, args
 
 
 def setup_model(args, tokenizer, train_loader, grad_accum):
@@ -51,10 +82,10 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
-    
+
     if len(tokenizer) > model.config.vocab_size:
         print(
             f"WARNING: tokenizer has {len(tokenizer)} tokens but model has {model.config.vocab_size} vocab size"
@@ -66,13 +97,32 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
     assert model.__class__.__name__ in [
         "MistralForCausalLM",
         "GPTMegatronForCausalLM",
-        "LlamaForCausalLM"
+        "LlamaForCausalLM",
     ], f"Model class name: {model.__class__.__name__} is not supported."
     
     model = convert_loss_to_reduce_sum(model)
     model.gradient_checkpointing_enable()
+    '''
+    #optimizer = FusedAdam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95))
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=args.num_warmup_steps,
+        num_training_steps=args.num_epochs * len(train_loader),
+    )
+    '''
+    model.to(dtype=torch.bfloat16, device=args.device)
+    param_optimizer = list(model.named_parameters())
+    no_decay = ['bias', 'gamma', 'beta', 'LayerNorm']
 
-    optimizer = FusedAdam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95))
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}]
+
+    print('Using HPU FusedAdamW')
+    optimizer_kwargs = {'params': optimizer_grouped_parameters, 'lr': args.learning_rate}
+    from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+    optimizer = FusedAdamW(**optimizer_kwargs)
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
@@ -82,6 +132,7 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
 
     model, _, _, lr_scheduler = deepspeed.initialize(
         model=model,
+        #model_parameters=None,
         optimizer=optimizer,
         config=get_ds_config(
             world_size=torch.distributed.get_world_size(),
@@ -91,6 +142,7 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
         lr_scheduler=lr_scheduler,
         dist_init_required=True,
     )
+
     # model = torch.compile(model)
     return model
 
@@ -117,14 +169,14 @@ def train(args, model, tokenizer, train_loader, grad_accum):
         if local_rank == 0:
             inner_pb = tqdm(range(len(train_loader)), desc=f"Epoch {epoch}")
         
-        aggregated_values = torch.zeros(3, dtype=torch.float32).to(local_rank)
+        aggregated_values = torch.zeros(3, dtype=torch.float32, device=args.device).to(args.device)
         for batch in train_loader:
             start = time.time()
-            aggregated_values[0] = batch["num_loss_counted_tokens"]
+            aggregated_values[0] = batch["num_loss_counted_tokens"].to(args.device)
             aggregated_values[1] = len(batch["input_ids"])
             if not args.is_granite:
                 for k in batch:
-                    batch[k] = batch[k].to(local_rank)
+                    batch[k] = batch[k].to(args.device)
 
             output = model(
                 **batch,
@@ -145,21 +197,25 @@ def train(args, model, tokenizer, train_loader, grad_accum):
             )
             
             model.backward(loss)
+            htcore.mark_step()
             model.step()
 
             if local_rank == 0:
                 elapsed_time = time.time() - start
                 overall_throughput = args.samples_per_gpu * world_size / elapsed_time
                 current_lr = model.lr_scheduler.get_last_lr()[0]
-                cuda_mem_allocated = torch.cuda.memory_allocated() / (1024**3)
-                cuda_malloc_retries = torch.cuda.memory_stats()["num_alloc_retries"]
+                if args.use_hpu:
+                    cuda_mem_allocated = htorch.hpu.memory_allocated() / (1024**3)
+                else:
+                    cuda_mem_allocated = torch.cuda.memory_allocated() / (1024**3)
+                    cuda_malloc_retries = torch.cuda.memory_stats()["num_alloc_retries"]
 
                 print(
                     f"throughput: {overall_throughput} "
                     f"samples/s, lr: {current_lr}, "
                     f"loss: {loss.item()} "
                     f"cuda_mem_allocated: {cuda_mem_allocated} GB "
-                    f"cuda_malloc_retries: {cuda_malloc_retries} "
+                    #f"cuda_malloc_retries: {cuda_malloc_retries} "
                     f"num_loss_counted_tokens: {num_loss_counted_tokens} "
                     f"batch_size: {aggregated_values[1]} "
                     f"total loss: {aggregated_values[2]/num_loss_counted_tokens}"
@@ -178,10 +234,8 @@ def train(args, model, tokenizer, train_loader, grad_accum):
                 inner_pb.update(1)
             torch.cuda.empty_cache()
 
-
 def main(args):
     import yaml
-
     if os.environ["LOCAL_RANK"] == "0":
         print(f"\033[38;5;120m{yaml.dump(vars(args), sort_keys=False)}\033[0m")
 
@@ -190,11 +244,16 @@ def main(args):
     # device = torch.device("cuda", args.local_rank)
 
     #### distributed init #####
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    args.local_rank = int(os.environ["LOCAL_RANK"])
-    deepspeed.init_distributed(timeout=timedelta(minutes=360))
+    if args.use_hpu:
+        device, args = setup_training(args)
+        args.device = device
+    else:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        args.local_rank = int(os.environ["LOCAL_RANK"])
+        deepspeed.init_distributed(dist_backend='hccl',timeout=timedelta(minutes=360))
+        args.device = torch,device('cuda')
     args.global_rank = torch.distributed.get_rank()
-    tensor = torch.ByteTensor([False]).cuda()
+    tensor = torch.ByteTensor([False]).to(args.device) #cuda()
     torch.distributed.all_reduce(tensor)
     torch.distributed.barrier()
 
@@ -224,7 +283,7 @@ def main(args):
         seed=args.seed,
     )
 
-    if args.local_rank == 0:
+    if torch.distributed.get_rank() == 0: #if args.local_rank == 0:
         print(
             f"\033[96mnum_gpus: {torch.distributed.get_world_size()}\n"
             f"avg_sample_len: {dataset.get_lengths().mean()}\n"
@@ -246,21 +305,27 @@ def main(args):
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--output_dir", type=str)
     parser.add_argument("--num_epochs", type=int, default=1)
-    # parser.add_argument("--samples_per_gpu", type=int, default=8)
+    parser.add_argument("--samples_per_gpu", type=int, default=8)
     parser.add_argument("--effective_batch_size", type=int, default=3840)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_warmup_steps", type=int, default=1000)
-    # parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--save_samples", type=int)
     parser.add_argument("--log_level", type=str, default="INFO")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mock_data", action="store_true")
     parser.add_argument("--mock_len", type=int, default=2600)
+    parser.add_argument('--local_rank',
+                        type=int,
+                        default=-1,
+                        help='local rank passed from distributed launcher')
+
     parser.add_argument(
         "--sharding_strategy",
         type=str,
@@ -268,9 +333,14 @@ if __name__ == "__main__":
         default="FULL_SHARD",
         help="Sharding strategy to be used for distributed training.",
     )
+
     parser.add_argument("--is_granite", action="store_true")
     parser.add_argument("--max_batch_len", type=int, default=60000)
     args = parser.parse_args()
+ 
+    args.bfloat16_enabled = True 
+    args.use_hpu = deepspeed.accelerator.get_accelerator().device_name() == "hpu"
+    print("use hpu ", args.use_hpu)
     set_random_seed(args.seed)
     main(args)
 
