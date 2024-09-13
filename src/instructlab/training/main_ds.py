@@ -444,6 +444,25 @@ def train(args, model, tokenizer, train_loader, grad_accum, metric_logger):
                         "weight_norm": weight_norm,
                     }
                 )
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "step": global_step,
+                        "rank": torch.distributed.get_rank(),
+                        "loss": loss.item(),
+                        "overall_throughput": overall_throughput,
+                        "lr": current_lr,
+                        "cuda_mem_allocated": cuda_mem_allocated,
+                        "cuda_malloc_retries": cuda_malloc_retries,
+                        "num_loss_counted_tokens": int(num_loss_counted_tokens),
+                        "batch_size": int(aggregated_values[1]),
+                        "total_loss": float(
+                            aggregated_values[2] / num_loss_counted_tokens
+                        ),
+                        "gradnorm": global_grad_norm,
+                        "weight_norm": weight_norm,
+                    }
+                )
 
             if args.save_samples > 0 and (
                 global_step * batch_size % args.save_samples == 0
@@ -736,6 +755,9 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
 if __name__ == "__main__":
     # TODO(osilkin): Configure a type that these args must adhere to for the sake of type checking
     #               Maybe switch out from argparse to something smarter
+    if int(os.environ["LOCAL_RANK"]) == 0:
+      import wandb
+      wandb.init()
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
     parser.add_argument("--data_path", type=str)
