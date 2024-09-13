@@ -759,7 +759,7 @@ if __name__ == "__main__":
     #               Maybe switch out from argparse to something smarter
 
     # To enable wandb set the WANDB_API_KEY environment variable to your API key
-    if os.getenv("WANDB_API_KEY") is not None and int(os.getenv("LOCAL_RANK")) == 0:
+    if os.getenv("WANDB_API_KEY") is not None and int(os.getenv("LOCAL_RANK","0")) == 0:
         wandb.init(project=os.getenv("WANDB_PROJECT"))
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
