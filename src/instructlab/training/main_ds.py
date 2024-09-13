@@ -445,7 +445,7 @@ def train(args, model, tokenizer, train_loader, grad_accum, metric_logger):
                         "weight_norm": weight_norm,
                     }
                 )
-                if os.getenv("WANDB_API_KEY") != None:
+                if os.getenv("WANDB_API_KEY") is not None:
                     wandb.log(
                         {
                             "epoch": epoch,
@@ -759,7 +759,7 @@ if __name__ == "__main__":
     #               Maybe switch out from argparse to something smarter
 
     # To enable wandb set the WANDB_API_KEY environment variable to your API key
-    if os.getenv("WANDB_API_KEY") != None and int(os.getenv("LOCAL_RANK")) == 0:
+    if os.getenv("WANDB_API_KEY") is not None and int(os.getenv("LOCAL_RANK")) == 0:
         wandb.init(project=os.getenv("WANDB_PROJECT"))
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
