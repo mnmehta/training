@@ -13,7 +13,6 @@ import time
 # Third Party
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from deepspeed.runtime.zero.utils import ZeRORuntimeException
-import wandb
 
 # pylint: disable=no-name-in-module
 from instructlab.dolomite.hf_models import GPTDolomiteForCausalLM
@@ -22,6 +21,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, get_scheduler
 import deepspeed
 import torch
+import wandb
 
 # First Party
 from instructlab.training import config
@@ -759,7 +759,10 @@ if __name__ == "__main__":
     #               Maybe switch out from argparse to something smarter
 
     # To enable wandb set the WANDB_API_KEY environment variable to your API key
-    if os.getenv("WANDB_API_KEY") is not None and int(os.getenv("LOCAL_RANK","0")) == 0:
+    if (
+        os.getenv("WANDB_API_KEY") is not None
+        and int(os.getenv("LOCAL_RANK", "0")) == 0
+    ):
         wandb.init(project=os.getenv("WANDB_PROJECT"))
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
