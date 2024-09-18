@@ -789,12 +789,6 @@ if __name__ == "__main__":
         and int(os.getenv("LOCAL_RANK", "0")) == 0
     ):
         wandb.init(project=os.getenv("WANDB_PROJECT"))
-    # To enable AIM experiment tracking set the AIM_REMOTE_URL environment variable the remote URL e.g. aim://hostname:53800
-    if (
-        os.getenv("AIM_REMOTE_URL") is not None
-        and int(os.getenv("LOCAL_RANK", "0")) == 0
-    ):
-        aimrun = Run(repo=os.getenv("AIM_REMOTE_URL"))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str)
@@ -892,6 +886,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_flash_attn", action="store_true")
     args = parser.parse_args()
+    # To enable AIM experiment tracking set the AIM_REMOTE_URL environment variable the remote URL e.g. aim://hostname:53800
+    if (
+        os.getenv("AIM_REMOTE_URL") is not None
+        and int(os.getenv("LOCAL_RANK", "0")) == 0
+    ):
+        aimrun = Run(repo=os.getenv("AIM_REMOTE_URL"))
+        aimrun["args"] = args.__dict__
     set_random_seed(args.seed)
     main(args)
 
