@@ -891,7 +891,7 @@ if __name__ == "__main__":
         os.getenv("AIM_REMOTE_URL") is not None
         and int(os.getenv("LOCAL_RANK", "0")) == 0
     ):
-        aimrun = Run(repo=os.getenv("AIM_REMOTE_URL"))
+        aimrun = Run(repo=os.getenv("AIM_REMOTE_URL"),log_system_params=True)
         aimrun["args"] = args.__dict__
     set_random_seed(args.seed)
     main(args)
