@@ -3,7 +3,7 @@
 # Standard
 from collections import OrderedDict
 from contextlib import contextmanager
-from copy import copy, deepcopy
+from copy import deepcopy
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,13 +21,13 @@ import warnings
 
 # Third Party
 # pylint: disable=no-name-in-module
+from accelerate import Accelerator
 from instructlab.dolomite.hf_models import (
     GPTDolomiteConfig,
     export_to_huggingface,
     import_from_huggingface,
 )
 from rich.logging import RichHandler
-from safetensors.torch import save_file
 from torch import distributed as dist
 from torch.distributed import get_rank, is_initialized
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -92,11 +92,14 @@ class StreamablePopen(subprocess.Popen):
         # remove the stderr and stdout from kwargs
         kwargs.pop("stderr", None)
         kwargs.pop("stdout", None)
+        self.output_file = output_file
 
         super().__init__(
             *args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs
         )
-        with open(output_file, "wb") as full_log_file:
+
+    def listen(self):
+        with open(self.output_file, "wb") as full_log_file:
             while True:
                 byte = self.stdout.read(1)
                 if byte:
@@ -532,27 +535,28 @@ def ensure_loadable_granite_checkpoint(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def get_module_class_from_name(
+    model: torch.nn.Module, name: str
+) -> torch.nn.Module | None:
+    modules_children = list(model.children())
+
+    if model.__class__.__name__ == name:
+        return model.__class__
+    elif len(modules_children) == 0:
+        return
+    else:
+        for child_module in modules_children:
+            module_class = get_module_class_from_name(child_module, name)
+            if module_class is not None:
+                return module_class
+
+
 # this function is for supporting gradient checkpointing for padding free
 # dolomite
 def apply_gradient_checkpointing(
     model: torch.nn.Module,
     **kwargs,
 ) -> None:
-    def get_module_class_from_name(
-        model: torch.nn.Module, name: str
-    ) -> List[torch.nn.Module]:
-        modules_children = list(model.children())
-
-        if model.__class__.__name__ == name:
-            return model.__class__
-        elif len(modules_children) == 0:
-            return
-        else:
-            for child_module in modules_children:
-                module_class = get_module_class_from_name(child_module, name)
-                if module_class is not None:
-                    return module_class
-
     def block_checkpointing(
         model: torch.nn.Module,
         block_name: str,
@@ -624,71 +628,113 @@ def _copy_no_lora_dict(state_dict):
     return cleaned_state_dict
 
 
-def save_hf_format_ds(
+def save_dict_accelerate(
+    accelerator,
+    state_to_save,
+    save_directory,
+    max_shard_size="5GB",
+    safe_serialization=True,
+):
+    old_get_state = accelerator.get_state_dict
+    accelerator.get_state_dict = _copy_no_lora_dict
+
+    def skip_precheck_loops():
+        return []
+
+    # The save model does a loop over modules and params in order to determine how to get state dict. Since we already have the state dict directly, we want to bypass those checks.
+    state_to_save.modules = skip_precheck_loops
+    state_to_save.parameters = skip_precheck_loops
+
+    accelerator.save_model(
+        state_to_save,
+        save_directory=save_directory,
+        max_shard_size=max_shard_size,
+        safe_serialization=safe_serialization,
+    )
+
+    accelerator.get_state_dict = old_get_state
+
+
+def save_hf_format_accelerate(
     args,
     model,
     tokenizer,
+    accelerator: Accelerator,
     samples_seen,
     convert_granite=True,
     is_lora=False,
 ):
-    model_to_save = model.module
     log_rank_0(
         f"\033[93mSaving model in huggingface format at samples_seen: {samples_seen}\033[0m",
         to_print=True,
     )
     start = time.time()
-    # used to save huggingface format, so we can use it for hf.from_pretrained
-    CONFIG_NAME = "config.json"
-    if args.is_granite:
-        # save if in a temp directory first then convert it
-        WEIGHTS_NAME = "model.safetensors"
-        MODEL_TYPE = "llama"
+
+    final_output_dir = Path(args.output_dir) / "hf_format" / f"samples_{samples_seen}"
+    if args.is_granite and convert_granite:
+        tmpdir = TemporaryDirectory("w")  # pylint: disable=consider-using-with
+        output_dir = Path(tmpdir.name)
     else:
-        WEIGHTS_NAME = "pytorch_model.bin"
-    output_dir = Path(args.output_dir) / "hf_format" / f"samples_{samples_seen}"
-    if torch.distributed.get_rank() == 0:
-        if is_lora:
-            model_to_save.merge_adapter()
+        output_dir = final_output_dir
 
-        model_state = model_to_save.state_dict()
+    CONFIG_NAME = "config.json"
+    output_config_file = output_dir / CONFIG_NAME
+
+    get_state_dict_unpatched = accelerator.get_state_dict
+
+    def _get_state_dict_patched(model, unwrap=False):
+        return get_state_dict_unpatched(model, unwrap=unwrap)
+
+    accelerator.get_state_dict = _get_state_dict_patched
+
+    if accelerator.is_main_process:
         if is_lora:
-            model_state = _copy_no_lora_dict(model_state)
+            model.module.merge_adapter()
+            model_state = model.module.state_dict()
+
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_model_file = output_dir / WEIGHTS_NAME
-        output_config_file = output_dir / CONFIG_NAME
-
-        tmp_conf = copy(model_to_save.config)
-        if not tmp_conf.architectures:
-            tmp_conf.architectures = ["LlamaForCausalLM"]
+        if not model.module.config.architectures and convert_granite:
+            model.module.config.architectures = ["LlamaForCausalLM"]
             warnings.warn(
-                f"No architectures provided in base model config, adding architectures to ckpt: {tmp_conf.architectures}",
+                f"Adding architectures to ckpt: {model.module.config.architectures}",
             )
-
-        if args.is_granite and convert_granite:
-            with TemporaryDirectory("w") as tmpdir:
-                save_file(model_state, Path(tmpdir) / WEIGHTS_NAME)
-                tmp_conf.to_json_file(Path(tmpdir) / CONFIG_NAME)
-                tokenizer.save_pretrained(tmpdir)
-                # export doesn't like the directory to exist
-                shutil.rmtree(output_dir)
-
-                export_to_huggingface(
-                    pretrained_model_name_or_path=tmpdir,
-                    save_path=output_dir,
-                    model_type=MODEL_TYPE,
-                )
-        else:
-            torch.save(model_state, str(output_model_file))
-            tmp_conf.to_json_file(str(output_config_file))
-            tokenizer.save_pretrained(str(output_dir))
+        model.module.config.to_json_file(output_config_file)
+        tokenizer.save_pretrained(output_dir)
 
         if is_lora:
-            model_to_save.unmerge_adapter()
+            save_dict_accelerate(
+                accelerator,
+                model_state,
+                save_directory=output_dir,
+                max_shard_size="5GB",
+                safe_serialization=True,
+            )
+            model.module.unmerge_adapter()
 
-    dist.barrier()
-    log_rank_0(f"\033[93mModel saved in {output_dir}\033[0m", to_print=True)
+    if not is_lora:
+        accelerator.save_model(
+            model,
+            save_directory=output_dir,
+            max_shard_size="5GB",
+            safe_serialization=True,
+        )
+
+    if args.is_granite and convert_granite and accelerator.is_main_process:
+        # export doesnt like the directory to exist
+        if final_output_dir.exists():
+            shutil.rmtree(final_output_dir)
+        export_to_huggingface(
+            pretrained_model_name_or_path=tmpdir.name,
+            save_path=final_output_dir,
+            model_type="llama",
+        )
+        tmpdir.cleanup()
+
+    log_rank_0(f"\033[93mModel saved in {final_output_dir}\033[0m", to_print=True)
     log_rank_0(f"saving took {time.time() - start} seconds")
+    dist.barrier()
+
+    accelerator.get_state_dict = get_state_dict_unpatched
 
 
 # this is native deepspeed saving with optimizer, scheduler
@@ -735,3 +781,119 @@ def set_random_seed(seed):
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+
+def save_checkpoint(
+    args,
+    accelerator: Accelerator,
+    model,
+    tokenizer,
+    samples_seen,
+    is_lora: bool,
+    epoch: int = None,
+    hf_format: bool = True,
+    full_state: bool = False,
+) -> None:
+    if hf_format:
+        save_hf_format_accelerate(
+            args=args,
+            model=model,
+            accelerator=accelerator,
+            tokenizer=tokenizer,
+            samples_seen=samples_seen,
+            is_lora=is_lora,
+        )
+
+    if full_state:
+        save_full_state(
+            args=args,
+            accelerator=accelerator,
+            is_lora=is_lora,
+            epoch=epoch,
+            samples_seen=samples_seen,
+        )
+
+
+def save_full_state(args, accelerator, is_lora: bool, epoch: int, samples_seen: int):
+    """
+    Saves model, optimizer, and lr_scheduler state.
+    TODO: save model config - decided not to do this.
+    TODO: save tokenizer - decided not to do this.
+    TODO: handle LoRA
+    TODO: handle granite
+    """
+    if is_lora:
+        raise NotImplementedError("Can't save full state for LoRA at the moment.")
+
+    # if args.is_granite:
+    #     raise NotImplementedError("Can't save full state for Granite models yet.")
+
+    output_dir = Path(args.output_dir) / "full_state" / f"epoch_{epoch}"
+    log_rank_0(f"\033[93mSaving full model state in {output_dir}\033[0m", to_print=True)
+
+    # patch FSDP state dict method so it works correctly.
+    def _get_state_dict_patched(model, unwrap=False):
+        return get_state_dict_unpatched(model, unwrap=unwrap)
+
+    if args.distributed_training_framework == "fsdp":
+        get_state_dict_unpatched = accelerator.get_state_dict
+        accelerator.get_state_dict = _get_state_dict_patched
+
+    accelerator.save_state(
+        output_dir=output_dir,
+        # max_shard_size="5GB",
+        # safe_serialization=True,
+    )
+
+    # save metadata file for current training status
+    if accelerator.is_main_process:
+        # TODO: should we set the global_step here rather than calculating global_step
+        #   based on samples_seen?
+        metadata = {"current_epoch": epoch, "samples_seen": samples_seen}
+        torch.save(metadata, output_dir / "training_metadata.json")
+        log_rank_0(f"\033[93mSaving training state: {metadata}\033[0m", to_print=True)
+
+    log_rank_0(f"\033[93mModel state saved in: {output_dir}\033[0m", to_print=True)
+
+    # cleanup
+    if args.distributed_training_framework == "fsdp":
+        accelerator.get_state_dict = get_state_dict_unpatched
+
+
+def load_latest_full_state(args, accelerator) -> None:
+    """
+    Loads accelerator state from most recently saved checkpoint
+    in `output_dir/full_state`.
+    """
+    output_dir = Path(args.output_dir) / "full_state"
+
+    if not output_dir.is_dir():
+        return
+
+    # picks checkpoint with the largest number of samples by splitting the "samples_NNNN" string on _
+    # and comparing the number at the end of the string
+    checkpoint_list = sorted(
+        list(output_dir.iterdir()),
+        reverse=True,
+        key=lambda x: int(str(x).rsplit("_", maxsplit=1)[-1]),
+    )
+
+    if len(checkpoint_list) == 0:
+        log_rank_0(
+            f"\033[93mNo checkpoints to load from: {output_dir}\033[0m", to_print=True
+        )
+        return
+
+    latest = checkpoint_list[0]
+
+    log_rank_0(f"\033[93mLoading state from: {latest}\033[0m", to_print=True)
+    accelerator.load_state(latest)
+
+    training_metadata = torch.load(latest / "training_metadata.json")
+    log_rank_0(
+        f"\033[93mTraining metadata loaded: {training_metadata}\033[0m", to_print=True
+    )
+
+    # previous epoch is basis for current epoch.
+    args.__dict__["current_epoch"] = training_metadata["current_epoch"] + 1
+    args.__dict__["samples_seen"] = training_metadata["samples_seen"]

@@ -433,6 +433,7 @@ disable=raw-checker-failed,
         inconsistent-return-statements,
         no-member,
         too-many-arguments,
+        too-many-positional-arguments,
         too-many-locals,
         too-many-branches,
         too-many-statements,
@@ -472,7 +473,8 @@ disable=raw-checker-failed,
         consider-using-generator,
         broad-exception-caught,
         super-init-not-called,
-        duplicate-code
+        duplicate-code,
+        too-many-positional-arguments
 
 # Enable the message, report, category or checker with the given id(s). You can
 # either give multiple identifier separated by comma (,) or put this option
