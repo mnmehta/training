@@ -451,18 +451,16 @@ def train(
                             "epoch": epoch,
                             "step": global_step,
                             "rank": torch.distributed.get_rank(),
-                            "loss": loss.item(),
                             "overall_throughput": overall_throughput,
                             "lr": current_lr,
                             "cuda_mem_allocated": cuda_mem_allocated,
                             "cuda_malloc_retries": cuda_malloc_retries,
                             "num_loss_counted_tokens": int(num_loss_counted_tokens),
-                            "batch_size": int(aggregated_values[1]),
-                            "total_loss": float(
-                                aggregated_values[2] / num_loss_counted_tokens
-                            ),
-                            "gradnorm": global_grad_norm,
-                            "weight_norm": weight_norm,
+                            "batch_size": int(micro_batch_size),
+                            "total_loss": float(log_loss / num_loss_counted_tokens),
+                            "samples_seen": samples_seen,
+                            # "gradnorm": global_grad_norm,
+                            # "weight_norm": weight_norm,
                         }
                     )
                 global aimrun
@@ -473,17 +471,16 @@ def train(
                             "epoch": epoch,
                             "step": global_step,
                             "rank": torch.distributed.get_rank(),
-                            "loss": loss.item(),
                             "overall_throughput": overall_throughput,
                             "lr": current_lr,
                             "cuda_mem_allocated": cuda_mem_allocated,
                             "cuda_malloc_retries": cuda_malloc_retries,
                             "num_loss_counted_tokens": int(num_loss_counted_tokens),
-                            "batch_size": int(aggregated_values[1]),
-                            "total_loss": float(
-                                aggregated_values[2] / num_loss_counted_tokens
-                            ),
-                            "weight_norm": weight_norm,
+                            "batch_size": int(micro_batch_size),
+                            "total_loss": float(log_loss / num_loss_counted_tokens),
+                            "samples_seen": samples_seen,
+                            # "gradnorm": global_grad_norm,
+                            # "weight_norm": weight_norm,
                         }
                      )
                   
