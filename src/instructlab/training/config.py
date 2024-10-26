@@ -6,7 +6,7 @@ Collection of config objects used in the InstructLab training library.
 
 # Standard
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 import os
 
 # Third Party
@@ -89,9 +89,13 @@ class LoraOptions(BaseModel):
     rank: int = 4
     alpha: int = 32
     dropout: float = 0.1
-    target_modules: list[str] = Field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
-    )
+
+    """
+    Selects the linear layers that we target for LoRA training.
+    When set to `None`, it selects all projection layers in the model (matching `_proj`).
+    `None` by default.
+    """
+    target_modules: Optional[List[str]] = None
 
     quantize_data_type: QuantizeDataType = QuantizeDataType.NONE
 
@@ -167,8 +171,9 @@ class TrainingArgs(BaseModel):
     save_samples: int
     learning_rate: float
     warmup_steps: int
-    is_padding_free: bool
     random_seed: int = 42
+    use_dolomite: bool = False
+    is_padding_free: bool = False  # TODO: deprecate
     checkpoint_at_epoch: bool = True
     accelerate_full_state_at_epoch: bool = True
 
@@ -195,3 +200,6 @@ class TrainingArgs(BaseModel):
     # https://github.com/instructlab/training/issues/28
     # quantize_dtype: QuantizeDataType = QuantizeDataType.NONE
     lora: LoraOptions | None = None
+
+    # This field defines whether or not data processing will occur inside of `run_training()`
+    process_data: Optional[bool] = True

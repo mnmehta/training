@@ -46,8 +46,11 @@ from instructlab.training.utils import (
     StreamablePopen,
     add_noisy_embeddings,
     apply_gradient_checkpointing,
+    check_flash_attn_enabled,
+    check_valid_train_args,
     convert_loss_to_reduce_sum,
-    ensure_loadable_granite_checkpoint,
+    ensure_loadable_dolomite_checkpoint,
+    get_projection_layer_names,
     load_latest_full_state,
     prepare_peft_model,
     prepare_universal_checkpoint_from_latest,
@@ -88,7 +91,7 @@ def setup_optimizer(args, model):
     return optimizer
 
 
-def setup_model(args, tokenizer, train_loader, grad_accum):
+def setup_model(args, tokenizer, train_loader, grad_accum, flash_enabled):
     bnb_config = None
     if args.lora_r > 0 and args.lora_quant_bits == 4:
         # Third Party
@@ -106,15 +109,11 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
         "torch_dtype": torch.bfloat16,
         "quantization_config": bnb_config,
     }
-    if not args.disable_flash_attn:
+    if flash_enabled:
         base_model_args["attn_implementation"] = "flash_attention_2"
-    elif args.is_granite:
-        raise RuntimeError(
-            "ERROR: Trying to use padding-free transformer without flash attention is not supported"
-        )
 
-    if args.is_granite:
-        with ensure_loadable_granite_checkpoint(
+    if args.use_dolomite:
+        with ensure_loadable_dolomite_checkpoint(
             args.model_name_or_path, args.output_dir
         ) as path:
             base_model_args["pretrained_model_name_or_path"] = path
@@ -169,9 +168,10 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
         "Starcoder2ForCausalLM",
         "GemmaForCausalLM",
         "MixtralForCausalLM",
+        "GraniteForCausalLM",
     ], f"Model class name: {model.__class__.__name__} is not supported."
 
-    model = convert_loss_to_reduce_sum(model, is_granite=args.is_granite)
+    model = convert_loss_to_reduce_sum(model, use_dolomite=args.use_dolomite)
     model = add_noisy_embeddings(model, noise_alpha=args.NEFTune_alpha)
 
     # handling of gradient checkpointing
@@ -183,13 +183,29 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
         # Third Party
         from peft import LoraConfig
 
-        if args.lora_target_modules is None:
-            args.__dict__["lora_target_modules"] = [
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-            ]
+        # ensure we select only the modules that exist in the model
+        proj_layers = get_projection_layer_names(model)
+        if not args.lora_target_modules:
+            print(
+                f"WARNING: lora_target_modules was not specified, defaulting to all of the model's projection modules"
+            )
+            if not proj_layers:
+                raise RuntimeError("could not find any projection layers in the model")
+            args.__dict__["lora_target_modules"] = proj_layers
+        else:
+            # when the user specifies the module, we should verify that they align with what's in the model
+            lora_target_modules_set = set(args.lora_target_modules)
+            diff = lora_target_modules_set - set(proj_layers)
+            layers_to_target = lora_target_modules_set - diff
+            if len(diff) == len(args.lora_target_modules):
+                raise ValueError(
+                    f"None of the modules you requested exist in the model.\nRequested modules: {args.lora_target_modules}; Available modules: {proj_layers}.\nThis is usually a misconfiuration error. Consider omitting your `lora_target_modules` list to have these discovered automatically."
+                )
+            if diff:
+                print(
+                    f"\033[33mWARNING: the following modules were targeted for LoRA but are not present in the model: {list(diff)}. Applying LoRA only to {list(layers_to_target)} modules.\033[0m"
+                )
+            args.__dict__["lora_target_modules"] = list(layers_to_target)
 
         peft_config = LoraConfig(
             lora_alpha=args.lora_alpha,
@@ -200,15 +216,15 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
             target_modules=args.lora_target_modules,
         )
         model = prepare_peft_model(
-            model, peft_config, gradient_checkpointing=not args.is_granite
+            model, peft_config, gradient_checkpointing=not args.use_dolomite
         )
 
-    elif not args.is_granite:
+    elif not args.use_dolomite:
         model.gradient_checkpointing_enable()
 
     # granite gradient checkpointing is handled uniformly
     # for both lora and full here
-    if args.is_granite:
+    if args.use_dolomite:
         block_name = model._no_split_modules[0]
         apply_gradient_checkpointing(
             model,
@@ -240,6 +256,9 @@ def setup_model(args, tokenizer, train_loader, grad_accum):
         deepcopy(train_loader),
         lr_scheduler,
     )
+    # Necessary so that Accelerate does not step once per GPU
+    # see https://github.com/huggingface/accelerate/blob/127818fc27ebe5cb236357fff59ff1748326d643/src/accelerate/scheduler.py#L69
+    lr_scheduler.split_batches = True
     return model, lr_scheduler, optimizer, accelerator
 
 
@@ -369,8 +388,8 @@ def train(
             num_loss_counted_tokens = float(
                 torch.tensor([batch.pop("num_loss_counted_tokens")])
             )
-            micro_batch_size = float(len(batch["input_ids"]))
-            if not args.is_granite:
+            micro_batch_size = float(torch.tensor([batch.pop("num_samples")]))
+            if not args.use_dolomite:
                 for k in batch:
                     batch[k] = batch[k].to(local_rank)
             output = model(
@@ -441,7 +460,7 @@ def train(
                         "batch_size": int(micro_batch_size),
                         "total_loss": float(log_loss / num_loss_counted_tokens),
                         "samples_seen": samples_seen,
-                        # "gradnorm": global_grad_norm,
+                        "gradnorm": global_grad_norm,
                         # "weight_norm": weight_norm,
                     }
                 )
@@ -562,6 +581,8 @@ def main(args):
     torch.distributed.all_reduce(tensor)
     torch.distributed.barrier()
 
+    flash_enabled = check_flash_attn_enabled(args.disable_flash_attn, args.use_dolomite)
+
     dataset = setup_dataset(
         args.data_path,
         mock=args.mock_data,
@@ -574,7 +595,7 @@ def main(args):
             avg_sample_len=dataset.get_lengths().mean(),
             effective_batch_size=args.effective_batch_size,
             max_batch_len_per_gpu=args.max_batch_len,
-            is_padding=not args.is_granite,
+            is_padding=not (args.use_dolomite or flash_enabled),
             dataset=dataset,
             seed=args.seed,
         )
@@ -597,7 +618,8 @@ def main(args):
         dataset,
         tokenizer.pad_token_id,
         num_workers=8,
-        is_granite=args.is_granite,
+        use_dolomite=args.use_dolomite,
+        flash_enabled=flash_enabled,
         max_batch_len=args.max_batch_len,
         packing_max_batch_len=packing_max_batch_len,
         samples_per_gpu=args.samples_per_gpu,
@@ -616,7 +638,8 @@ def main(args):
             dataset,
             tokenizer.pad_token_id,
             num_workers=8,
-            is_granite=args.is_granite,
+            use_dolomite=args.use_dolomite,
+            flash_enabled=flash_enabled,
             max_batch_len=args.max_batch_len,
             packing_max_batch_len=packing_max_batch_len,
             samples_per_gpu=args.samples_per_gpu,
@@ -640,7 +663,7 @@ def main(args):
         )
 
     model, lr_scheduler, optimizer, accelerator = setup_model(
-        args, tokenizer, train_loader, grad_accum
+        args, tokenizer, train_loader, grad_accum, flash_enabled
     )
 
     load_latest_full_state(args=args, accelerator=accelerator)
@@ -666,30 +689,24 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
     """
     Wrapper around the main training job that calls torchrun.
     """
-    # early validation logic here
-    if train_args.max_batch_len < train_args.max_seq_len:
-        raise ValueError(
-            f"the `max_batch_len` cannot be less than `max_seq_len`: {train_args.max_batch_len=} < {train_args.max_seq_len=}"
-        )
+    check_valid_train_args(train_args)
 
-    # process the training data
-    if not os.path.exists(train_args.data_output_dir):
-        os.makedirs(train_args.data_output_dir, exist_ok=True)
-    dp.main(
-        DataProcessArgs(
-            # XXX(osilkin): make a decision here, either:
-            #   1. the CLI is fully responsible for managing where the data is written
-            #   2. we never cache it and simply write it to a tmp file every time.
-            #
-            # An important reason for why #1 would be preferable is in the case of OpenShift/SELinux
-            # where the user has a defined place for new temporary data to be written.
-            data_output_path=train_args.data_output_dir,
-            model_path=train_args.model_path,
-            data_path=train_args.data_path,
-            max_seq_len=train_args.max_seq_len,
-            chat_tmpl_path=train_args.chat_tmpl_path,
+    if train_args.process_data:
+        dp.main(
+            DataProcessArgs(
+                # XXX(osilkin): make a decision here, either:
+                #   1. the CLI is fully responsible for managing where the data is written
+                #   2. we never cache it and simply write it to a tmp file every time.
+                #
+                # An important reason for why #1 would be preferable is in the case of OpenShift/SELinux
+                # where the user has a defined place for new temporary data to be written.
+                data_output_path=train_args.data_output_dir,
+                model_path=train_args.model_path,
+                data_path=train_args.data_path,
+                max_seq_len=train_args.max_seq_len,
+                chat_tmpl_path=train_args.chat_tmpl_path,
+            )
         )
-    )
 
     if not os.path.exists(train_args.ckpt_output_dir):
         os.makedirs(train_args.ckpt_output_dir, exist_ok=True)
@@ -726,14 +743,10 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
         if train_args.mock_len:
             command.append(f"--mock_len={train_args.mock_len}")
 
-    if train_args.is_padding_free:
-        command.append("--is_granite")
+    if train_args.use_dolomite:
+        command.append("--use_dolomite")
 
     if train_args.disable_flash_attn:
-        if train_args.is_padding_free:
-            raise RuntimeError(
-                "ERROR: Trying to use padding-free transformer without flash attention is not supported"
-            )
         command.append("--disable_flash_attn")
 
     if train_args.lora:
@@ -745,7 +758,8 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
                 "--lora_target_modules",
             ]
         )
-        command.extend(train_args.lora.target_modules)
+        if train_args.lora.target_modules:
+            command.extend(train_args.lora.target_modules)
         # hard-code 4-bit quantization for now, change this when we add more
         quant_dtype = train_args.lora.quantize_data_type
         quantization_is_enabled = quant_dtype in (
@@ -789,6 +803,7 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
     print(f"\033[92mRunning training command as subprocess: {' '.join(command)}\033[0m")
     process = None
     interrupt: KeyboardInterrupt | Exception | None = None
+    failure = False
     try:
         process = StreamablePopen(
             f"{train_args.ckpt_output_dir}/full_logs_global{torch_args.node_rank}.log",
@@ -799,19 +814,20 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
         print("Training subprocess interrupted by user.")
         interrupt = e
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        print("Unexpected exception received during distributed training")
         interrupt = e
     finally:
         if "process" not in locals() or process is None:
             return
-        if process.poll() == 0:
-            print("\033[92mTraining subprocess exited successfully! 🎉\033[0m")
+
+        failure = process.poll() != 0
+        if not failure:
+            print("\033[92mOperation completed successfully! 🎉\033[0m")
         else:
             print(
                 "\033[91mTraining subprocess has not exited yet. Sending SIGTERM.\033[0m"
             )
 
-        print("Sending interrupt signal to Training subprocess.")
         process.terminate()
         try:
             print("Waiting for process to exit, 60s...")
@@ -823,8 +839,11 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
             process.kill()
 
         if interrupt:
-            print(f"Error caught from training subprocess.: {interrupt}")
             raise interrupt
+        if failure:
+            raise RuntimeError(
+                "Suffered a failure during distributed training. Please see the training logs for more context."
+            )
 
 
 if __name__ == "__main__":
@@ -919,12 +938,17 @@ if __name__ == "__main__":
         default="SHARD_GRAD_OP",
         help="Sharding strategy to be used for FSDP distributed training.",
     )
-    parser.add_argument("--is_granite", action="store_true")
+    parser.add_argument("--use_dolomite", action="store_true")
     parser.add_argument("--lora_r", type=int, default=0)  # set to > 0 to activate lora
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--lora_quant_bits", type=int, default=None)
-    parser.add_argument("--lora_target_modules", nargs="+", default=None)
+    parser.add_argument(
+        "--lora_target_modules",
+        nargs="*",
+        default=None,
+        help="Which modules we should target for injecting LoRA layers. Defaults to selecting all projection layers when no values are provided.",
+    )
     parser.add_argument("--max_batch_len", type=int, default=60000)
     parser.add_argument(
         "--cpu_offload_optimizer",
@@ -1010,7 +1034,7 @@ torchrun --nnodes=$WORLD_SIZE --node_rank=$RANK \
 --save_samples=250000 \
 --log_level="INFO" \
 --fsdp_sharding_strategy="SHARD_GRAD_OP" \
---is_granite \
+--use_dolomite \
 --max_batch_len 70000 \
 --seed=42
 """
